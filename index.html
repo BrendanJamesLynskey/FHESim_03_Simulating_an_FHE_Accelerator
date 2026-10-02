@@ -908,13 +908,13 @@
         <tr><th>Source</th><th>How</th><th>Status here</th></tr>
         <tr><td><strong>Scheme model</strong> (<code>workload.py</code>)</td><td>Builds bootstrapping from the algorithm: key-switch recipes, BSGS DFT levels, Chebyshev EvalMod, level tracking</td><td>Implemented; operation counts are tested against closed forms</td></tr>
         <tr><td><strong>HEIR</strong> (<a href="https://heir.dev">heir.dev</a>; Ali et al., <a href="https://arxiv.org/abs/2508.11095">arXiv:2508.11095</a>)</td><td>An MLIR-based FHE compiler. Programs are lowered through scheme-level dialects to polynomial and modular-arithmetic levels where NTTs, key switches and base conversions are explicit; a pass or translator there could emit this trace format</td><td><strong>Not implemented.</strong> HEIR's dialects and pipelines change quickly; consult its docs rather than any summary</td></tr>
-        <tr><td><strong>OpenFHE</strong> (<a href="https://eprint.iacr.org/2022/915">ePrint 2022/915</a>)</td><td>Instrument the C++ library's key-switching, NTT and automorphism routines and log calls with shapes</td><td><strong>Not done.</strong> openfhe-python installs from pip and was used for <em>timing calibration</em> (slide 11), but its Python API does not expose the kernel stream</td></tr>
+        <tr><td><strong>OpenFHE</strong> (<a href="https://eprint.iacr.org/2022/915">ePrint 2022/915</a>)</td><td>Instrument the C++ library's NTT, base-conversion, key-switching, automorphism and rescale routines; log each call with its shape and the identity of its key or plaintext; replay the stream</td><td><strong>Done</strong> for two bootstraps of OpenFHE v1.5.1 (a 78-line patch, in <code>calibration/openfhe_trace</code>). The model is checked against them in deck 02; the replay is the best timing predictor (slide 11)</td></tr>
         <tr><td><strong>Lattigo</strong> (Go)</td><td>The same instrumentation approach</td><td>Not done</td></tr>
     </table>
     </div>
     <div class="callout">
         <div class="callout-label">Why a compiler front end matters</div>
-        <p>A hand-built scheme model reproduces the algorithm someone chose. A trace from the compiler that will actually target the hardware captures its real level management, packing and fusion decisions. That is how the simulator gets connected to applications, as deck 09 of the sister series discusses for PyTorch and ONNX.</p>
+        <p>A hand-built scheme model reproduces the algorithm someone chose. A trace from the compiler that will actually target the hardware captures its real level management, packing and fusion decisions. The OpenFHE traces show the catch: a CPU library's trace carries CPU-tuned choices. OpenFHE's BSGS split saves a third of the NTTs but needs more rotation keys, which makes a memory-bound accelerator 42% slower (deck 05). That is why the compiler targeting the hardware, not a CPU library, should produce the trace; deck 09 of the sister series discusses the same point for PyTorch and ONNX.</p>
     </div>
 </section>
 
@@ -1091,7 +1091,9 @@
         'lattigo': { name: 'Lattigo-like (N=2^16, L=24, dnum=5)', logN: 16, L: 24, dnum: 5 },
         'gpu100x': { name: '100x GPU (N=2^16, L=34, dnum=5)', logN: 16, L: 34, dnum: 5 },
         'openfhe-sparse': { name: 'OpenFHE sparse (N=2^16, L=18, dnum=3, 8 slots)', logN: 16, L: 18, dnum: 3, qBits: 59,
-                            logSlots: 3, ctsLevels: 1, stcLevels: 1, evalmodDegree: 119, doubleAngle: 3 },
+                            logSlots: 3, ctsLevels: 1, stcLevels: 1, evalmodDegree: 88, doubleAngle: 6 },
+        'openfhe-full14': { name: 'OpenFHE full slots (N=2^14, L=30, dnum=3)', logN: 14, L: 30, dnum: 3, qBits: 59,
+                            ctsLevels: 3, stcLevels: 3, evalmodDegree: 88, doubleAngle: 6 },
         'small': { name: 'small test set (N=2^12, L=11, dnum=3)', logN: 12, L: 11, dnum: 3, ctsLevels: 2, stcLevels: 2,
                    evalmodDegree: 15, doubleAngle: 1 },
     };
@@ -1157,6 +1159,34 @@
             const ks = [K('auto', w, 2 * w), ...B.seedKernels(lev), ...ksTail(p, lev)];
             return B.emit('hrot', lev, [x, digits], lev, ks, B.key(kid, lev));
         };
+        B.extend = x => {
+            const lev = B.lvl(x), N = p.N, l = lev + 1;
+            return B.emit('extend', lev, [x], lev, [kMac(2 * l * N)], null, [], 2 * (l + p.k) * N * 8);
+        };
+        B.hrotHoistedExt = (x, digits, kid) => {
+            const lev = B.lvl(x), N = p.N, l = lev + 1, k = p.k, b = p.beta(lev);
+            const w = (l + b * (l + k)) * N;
+            const ks = [K('auto', w, 2 * w), ...B.seedKernels(lev), ...ksTail(p, lev).slice(0, 1)];
+            return B.emit('hrot', lev, [x, digits], lev, ks, B.key(kid, lev), [], 2 * (l + k) * N * 8);
+        };
+        B.pmacExt = (xs, ptIds, moddown) => {
+            const lev = B.lvl(...xs), N = p.N, l = lev + 1, m = xs.length, lk = l + p.k;
+            let kern = [kMac(2 * lk * N * m + 2 * lk * N * (m - 1))], pts;
+            if (o.otfPlaintexts) { kern = [kNtt(lk * m, N), kMac(lk * N * m), ...kern]; pts = ptIds.map(id => [id, N * 8]); }
+            else pts = ptIds.map(id => [id, lk * N * 8]);
+            const down = moddown ? ksTail(p, lev).slice(1) : [];
+            return B.emit('pmac', lev, xs, lev, [...kern, ...down], null, pts, moddown ? undefined : 2 * lk * N * 8);
+        };
+        B.hrotExt = (x, kid) => {
+            const lev = B.lvl(x), N = p.N, l = lev + 1;
+            const ks = [K('auto', 2 * l * N, 4 * l * N), ...ksModup(p, lev), ...B.seedKernels(lev), ...ksTail(p, lev).slice(0, 1)];
+            return B.emit('hrot', lev, [x], lev, ks, B.key(kid, lev), [], 2 * (l + p.k) * N * 8);
+        };
+        B.addExt = xs => {
+            const lev = B.lvl(...xs), N = p.N, lk = lev + 1 + p.k;
+            const kern = [kMac(2 * lk * N * Math.max(1, xs.length - 1)), ...ksTail(p, lev).slice(1), ...rescaleKernels(p, lev)];
+            return B.emit('add', lev, xs, lev - 1, kern);
+        };
         B.pmac = (xs, ptIds) => {
             const lev = B.lvl(...xs), N = p.N, l = lev + 1, m = xs.length;
             let kern = [kMac(2 * l * N * m + 2 * l * N * (m - 1))], pts;
@@ -1182,10 +1212,22 @@
         B.dft = (x, prefix, nLevels) => {
             const split = dftSplit(p.slotsLog, nLevels);
             for (let j = 0; j < split.length; j++) {
-                const k = split[j], d = 2 ** (k + 1) - 1, n1 = Math.min(2 ** cdiv(k + 1, 2), d), n2 = cdiv(d, n1), tag = `${prefix}${j}`;
+                const k = split[j], d = Math.min(2 ** (k + 1) - 1, 2 ** p.slotsLog), tag = `${prefix}${j}`;
+                const lazy = o.lazyModdown && o.hoisting && !o.minKs;
+                let n1;
+                if (lazy && d === p.slots) {
+                    const sl = p.slots, c = Math.floor(Math.sqrt(sl - 1)) + 1;     // ceil(sqrt(slots)), exact for these sizes
+                    n1 = sl > 1 ? Math.min(2 ** (c.toString(2).length - 1 + 1), d) : 1;
+                } else if (lazy) n1 = Math.min(2 ** (Math.floor(k / 2) + 1 + (d > 7 ? 1 : 0)), d);
+                else n1 = Math.min(2 ** cdiv(k + 1, 2), d);
+                const n2 = cdiv(d, n1);
                 const babies = [x];
                 if (n1 > 1) {
                     if (o.minKs) { for (let i = 1; i < n1; i++) babies.push(B.hrot(babies[babies.length - 1], `${tag}.b`)); }
+                    else if (o.hoisting && o.lazyModdown) {
+                        const dig = B.modup(x); babies[0] = B.extend(x);
+                        for (let i = 1; i < n1; i++) babies.push(B.hrotHoistedExt(x, dig, `${tag}.b${i}`));
+                    }
                     else if (o.hoisting) { const dig = B.modup(x); for (let i = 1; i < n1; i++) babies.push(B.hrotHoisted(x, dig, `${tag}.b${i}`)); }
                     else { for (let i = 1; i < n1; i++) babies.push(B.hrot(x, `${tag}.b${i}`)); }
                 }
@@ -1193,12 +1235,16 @@
                 for (let g = 0; g < n2; g++) {
                     const m = Math.min(n1, d - g * n1), ids = [];
                     for (let i = 0; i < m; i++) ids.push(`${tag}.d${g}.${i}`);
-                    inners.push(B.pmac(babies.slice(0, m), ids));
+                    inners.push(lazy && n1 > 1 ? B.pmacExt(babies.slice(0, m), ids, g > 0) : B.pmac(babies.slice(0, m), ids));
                 }
                 if (o.minKs) {
                     let acc = inners[inners.length - 1];
                     for (let g = n2 - 2; g >= 0; g--) acc = B.add([B.hrot(acc, `${tag}.g`), inners[g]], g === 0);
                     x = n2 > 1 ? acc : B.add([acc], true);
+                } else if (lazy && n1 > 1) {
+                    const parts = [inners[0]];
+                    for (let g = 1; g < n2; g++) parts.push(B.hrotExt(inners[g], `${tag}.g${g}`));
+                    x = B.addExt(parts);
                 } else {
                     const parts = [inners[0]];
                     for (let g = 1; g < n2; g++) parts.push(B.hrot(inners[g], `${tag}.g${g}`));
@@ -1240,7 +1286,7 @@
         return B;
     }
     function bootOptions(o) {
-        return Object.assign({ nBoot: 1, hoisting: true, minKs: false, seededKeys: false, otfPlaintexts: false }, o || {});
+        return Object.assign({ nBoot: 1, hoisting: true, minKs: false, seededKeys: false, otfPlaintexts: false, lazyModdown: false }, o || {});
     }
     function bootstrapTrace(p, opts) {
         const o = bootOptions(opts), B = Builder(p, o);
@@ -1709,7 +1755,7 @@
     }
 
     // ── convenience for the parity test and the deck ─────────────────
-    const camel = o => { const m = { n_boot: 'nBoot', min_ks: 'minKs', seeded_keys: 'seededKeys', otf_plaintexts: 'otfPlaintexts' }, out = {};
+    const camel = o => { const m = { n_boot: 'nBoot', min_ks: 'minKs', seeded_keys: 'seededKeys', otf_plaintexts: 'otfPlaintexts', lazy_moddown: 'lazyModdown' }, out = {};
         for (const [k, v] of Object.entries(o || {})) out[m[k] || k] = v; return out; };
     function simulateNamed(paramsName, hwName, opts, dvfs, hwOver) {
         const p = mkParams(PARAMS[paramsName]);
@@ -1874,7 +1920,7 @@
 <section class="slide" id="slide-11">
     <div class="slide-number">11</div>
     <h2>Validation</h2>
-    <p>64 tests, organised as a verification ladder (the method is in <a href="https://brendanjameslynskey.github.io/InfSim_06_Metrics_Hotspots_Validation/">LLM Inference Simulators deck 06</a>):</p>
+    <p>74 tests, organised as a verification ladder (the method is in <a href="https://brendanjameslynskey.github.io/InfSim_06_Metrics_Hotspots_Validation/">LLM Inference Simulators deck 06</a>):</p>
     <div class="table-wrap">
     <table>
         <tr><th>Rung</th><th>Checks</th></tr>
@@ -1885,7 +1931,8 @@
         <tr><td>Behaviour</td><td>More SRAM never raises traffic; the baseline is memory-bound; key-reuse techniques shift the bound; they hurt NTT-bound designs; optics helps NTT-bound designs and not memory-bound ones</td></tr>
         <tr><td>Power</td><td>Energy accounts add up; peak &le; TDP under both power modes, down to a 100 W TDP; the dynamic manager beats worst-case clocking where that wastes the budget and throttles when the real draw binds; DVFS saves energy when memory-bound</td></tr>
         <tr><td>Property-based</td><td>Hypothesis: 60 random parameter sets, algorithms, hardware and power modes; all invariants, the TDP and determinism</td></tr>
-        <tr><td>External</td><td>Optical precision rule against a functional model (deck 04); calibration against OpenFHE; JavaScript against Python, bit-exact on 22 configurations, in both power modes</td></tr>
+        <tr><td>Real library</td><td>Two recorded OpenFHE bootstraps: identical key-switch traffic where the algorithms agree, identical bootstrap depth (16 and 20), DFT transforms within 20% under OpenFHE's BSGS, and EvalMod's rescale-on-use difference pinned down (deck 02)</td></tr>
+        <tr><td>External</td><td>Optical precision rule against a functional model (deck 04); timing calibration against OpenFHE; JavaScript against Python, bit-exact on 26 configurations, in both power modes</td></tr>
     </table>
     </div>
     <div class="table-wrap">
@@ -1893,10 +1940,11 @@
         <tr><th>Calibration (openfhe-python, i7-3770, 8 threads)</th><th>OpenFHE</th><th>Simulated</th><th>Error</th></tr>
         <tr><td>HMult, N = 2<sup>16</sup>, 24 limbs, dnum 4 (fitted)</td><td>352.6 ms</td><td>352.6 ms</td><td>0%</td></tr>
         <tr><td>HRotate, same parameters (predicted)</td><td>324.8 ms</td><td>292.5 ms</td><td>&minus;10%</td></tr>
-        <tr><td>Bootstrap, N = 2<sup>16</sup>, 8 slots, dnum 3 (predicted)</td><td>12,113 ms</td><td>9,283 ms</td><td>&minus;23%</td></tr>
+        <tr><td>Bootstrap, N = 2<sup>16</sup>, 8 slots, dnum 3: scheme model (predicted)</td><td>12,113 ms</td><td>8,473 ms</td><td>&minus;30%</td></tr>
+        <tr><td>Same bootstrap: OpenFHE's own recorded kernel stream, replayed (predicted)</td><td>12,113 ms</td><td>10,759 ms</td><td>&minus;11%</td></tr>
     </table>
     </div>
-    <p>One parameter was fitted (0.18 modular operations per cycle per unit). A full-slot N = 2<sup>16</sup> OpenFHE bootstrap could not be measured: its keys and precomputed plaintexts exceeded the memory available on the 15 GB test machine.</p>
+    <p>One parameter was fitted (0.18 modular operations per cycle per unit). The scheme model under-predicts the bootstrap mainly because OpenFHE rescales copies of each input before every multiplication, doubling EvalMod's transforms. Replaying the recorded stream removes that gap; most of the remaining &minus;11% is element-wise work the tracer does not log. A full-slot N = 2<sup>16</sup> OpenFHE bootstrap could not be measured or recorded: its keys and precomputed plaintexts exceeded the memory available on the 15 GB test machine.</p>
 </section>
 
 <section class="slide" id="slide-12">
@@ -1913,16 +1961,18 @@
         <tr><td><code>metrics.py</code>, <code>trace.py</code></td><td>Metrics, bound attribution, hot-spots; Perfetto export</td></tr>
         <tr><td><code>precision.py</code></td><td>Functional model of an analogue NTT (deck 04)</td></tr>
         <tr><td><code>search.py</code></td><td>Analytic bound, sweeps, bisection, Pareto front</td></tr>
+        <tr><td><code>openfhe_trace.py</code></td><td>Reads a kernel stream recorded from instrumented OpenFHE; per-stage counts; converts it to a replayable trace</td></tr>
         <tr><td><code>web/sim_engine.js</code></td><td>The port running on this page, with its minimal SimPy core</td></tr>
     </table>
     </div>
     <div class="code-block">
         <div class="code-header">Quick start</div>
-        <pre><code>pip install -e .[dev] &amp;&amp; pytest                        <span class="cm"># 64 tests</span>
+        <pre><code>pip install -e .[dev] &amp;&amp; pytest                        <span class="cm"># 74 tests</span>
 fhe-sim                                                <span class="cm"># the default run on slide 08</span>
 fhe-sim --counts                                       <span class="cm"># deck 02's per-stage table</span>
 fhe-sim --sweep-sram 128 256 512 1024 2048             <span class="cm"># traffic against SRAM</span>
 fhe-sim --min-ks --seeded-keys --otf-pt --trace b.json <span class="cm"># open in ui.perfetto.dev</span>
+fhe-sim --openfhe-log calibration/openfhe_trace/sparse16.log.gz --hw cpu   <span class="cm"># a real OpenFHE bootstrap</span>
 python examples/results.py                             <span class="cm"># every number in this series</span></code></pre>
     </div>
 </section>
@@ -1935,7 +1985,7 @@ python examples/results.py                             <span class="cm"># every 
         <li><strong>Model keys as named objects</strong> in a capacity-limited scratchpad, or the SRAM question cannot be asked.</li>
         <li><strong>Units and HBM as SimPy resources</strong>, dependencies as events and an issue window give overlap without cycle-level detail: a bootstrap in about 70 ms of Python or 12 ms of JavaScript.</li>
         <li><strong>The default ARK-class design is memory-bound</strong> (13.94 ms, HBM 89% busy), with CoeffToSlot as the hot-spot.</li>
-        <li><strong>Validation is layered</strong>: hand formulas, invariants, flow-shop algebra, behaviour, properties, a functional model, OpenFHE timings and a bit-exact twin.</li>
+        <li><strong>Validation is layered</strong>: hand formulas, invariants, flow-shop algebra, behaviour, properties, a functional model, recorded OpenFHE kernel streams, OpenFHE timings and a bit-exact twin.</li>
     </ul>
     <div class="callout">
         <div class="callout-label">Next</div>
