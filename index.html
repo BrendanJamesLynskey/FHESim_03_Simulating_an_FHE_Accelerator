@@ -830,8 +830,9 @@
         <li><a href="#slide-09">Interactive: Run the Simulator</a></li>
         <li><a href="#slide-10">Experiments to Try</a></li>
         <li><a href="#slide-11">Validation</a></li>
-        <li><a href="#slide-12">Reading the Code</a></li>
-        <li><a href="#slide-13">What to Take Away</a></li>
+        <li><a href="#slide-12">A HEIR Front End: Real Programs</a></li>
+        <li><a href="#slide-13">Reading the Code</a></li>
+        <li><a href="#slide-14">What to Take Away</a></li>
     </ul>
 </section>
 
@@ -907,7 +908,7 @@
     <table>
         <tr><th>Source</th><th>How</th><th>Status here</th></tr>
         <tr><td><strong>Scheme model</strong> (<code>workload.py</code>)</td><td>Builds bootstrapping from the algorithm: key-switch recipes, BSGS DFT levels, Chebyshev EvalMod, level tracking</td><td>Implemented; operation counts are tested against closed forms</td></tr>
-        <tr><td><strong>HEIR</strong> (<a href="https://heir.dev">heir.dev</a>; Ali et al., <a href="https://arxiv.org/abs/2508.11095">arXiv:2508.11095</a>)</td><td>An MLIR-based FHE compiler. Programs are lowered through scheme-level dialects to polynomial and modular-arithmetic levels where NTTs, key switches and base conversions are explicit; a pass or translator there could emit this trace format</td><td><strong>Not implemented.</strong> HEIR's dialects and pipelines change quickly; consult its docs rather than any summary</td></tr>
+        <tr><td><strong>HEIR</strong> (<a href="https://heir.dev">heir.dev</a>; Ali et al., <a href="https://arxiv.org/abs/2508.11095">arXiv:2508.11095</a>)</td><td>An MLIR-based FHE compiler. After <code>--torch-linalg-to-ckks</code> with unrolled kernel loops, the server function is straight-line code in HEIR's <code>ckks</code> dialect, with every value's level in its type. HEIR has already chosen the packing, rotations, rescales and bootstrap placement</td><td><strong>Done</strong> (<code>heir_frontend.py</code>, release v2026.10.01): one HE operation per <code>ckks</code> op, dependencies from SSA, levels checked against HEIR's types. Three of HEIR's example programs are in the repo (slide 12). HEIR's dialects change quickly, so the front end names the release it was validated on</td></tr>
         <tr><td><strong>OpenFHE</strong> (<a href="https://eprint.iacr.org/2022/915">ePrint 2022/915</a>)</td><td>Instrument the C++ library's NTT, base-conversion, key-switching, automorphism and rescale routines; log each call with its shape and the identity of its key or plaintext; replay the stream</td><td><strong>Done</strong> for two bootstraps of OpenFHE v1.5.1 (a 78-line patch, in <code>calibration/openfhe_trace</code>). The model is checked against them in deck 02; the replay is the best timing predictor (slide 11)</td></tr>
         <tr><td><strong>Lattigo</strong> (Go)</td><td>The same instrumentation approach</td><td>Not done</td></tr>
     </table>
@@ -1099,7 +1100,7 @@
     };
 
     // ── workload (workload.py) ───────────────────────────────────────
-    const STAGES = ['modraise', 'cts', 'evalmod', 'stc'];
+    const STAGES = ['modraise', 'cts', 'evalmod', 'stc', 'app', 'app_post'];
     const K = (kind, amount, words) => ({ kind, amount, words });
     const kNtt = (limbs, N, inv) => K(inv ? 'intt' : 'ntt', limbs, 2 * limbs * N);
     const kMac = ops => K('mac', ops, 3 * ops);
@@ -1920,7 +1921,7 @@
 <section class="slide" id="slide-11">
     <div class="slide-number">11</div>
     <h2>Validation</h2>
-    <p>74 tests, organised as a verification ladder (the method is in <a href="https://brendanjameslynskey.github.io/InfSim_06_Metrics_Hotspots_Validation/">LLM Inference Simulators deck 06</a>):</p>
+    <p>89 tests, organised as a verification ladder (the method is in <a href="https://brendanjameslynskey.github.io/InfSim_06_Metrics_Hotspots_Validation/">LLM Inference Simulators deck 06</a>):</p>
     <div class="table-wrap">
     <table>
         <tr><th>Rung</th><th>Checks</th></tr>
@@ -1932,6 +1933,7 @@
         <tr><td>Power</td><td>Energy accounts add up; peak &le; TDP under both power modes, down to a 100 W TDP; the dynamic manager beats worst-case clocking where that wastes the budget and throttles when the real draw binds; DVFS saves energy when memory-bound</td></tr>
         <tr><td>Property-based</td><td>Hypothesis: 60 random parameter sets, algorithms, hardware and power modes; all invariants, the TDP and determinism</td></tr>
         <tr><td>Real library</td><td>Two recorded OpenFHE bootstraps: identical key-switch traffic where the algorithms agree, identical bootstrap depth (16 and 20), DFT transforms within 20% under OpenFHE's BSGS, and EvalMod's rescale-on-use difference pinned down (deck 02)</td></tr>
+        <tr><td>Compiler</td><td>Three HEIR-compiled programs: parameters, one HE op per <code>ckks</code> op, every level matching HEIR's types, bootstraps and polynomial activations expanded, and the same LoLa matching OpenFHE's execution on rotations, keys and relinearisations</td></tr>
         <tr><td>External</td><td>Optical precision rule against a functional model (deck 04); timing calibration against OpenFHE; JavaScript against Python, bit-exact on 26 configurations, in both power modes</td></tr>
     </table>
     </div>
@@ -1949,6 +1951,26 @@
 
 <section class="slide" id="slide-12">
     <div class="slide-number">12</div>
+    <h2>A HEIR Front End: Real Programs</h2>
+    <p>Three of HEIR's own example programs, compiled with the HEIR v2026.10.01 release binaries and simulated on the ARK-class design (<code>fhe-sim --heir</code>). HEIR picked every parameter, rotation, rescale and bootstrap; the front end expands each op into kernels. LoLa is an MNIST CNN with square activations (55 rotations); the MLP has a polynomial ReLU; the third row is LoLa compiled with a level budget of 2, so HEIR must place a bootstrap. All four runs are memory-bound.</p>
+    <div class="table-wrap">
+    <table>
+        <tr><th>Program</th><th>N, limbs</th><th>HE ops</th><th>Scratchpad</th><th>Latency</th><th>Keys / plaintexts / ciphertexts</th></tr>
+        <tr><td>LoLa (MNIST CNN)</td><td>2<sup>15</sup>, 11</td><td>409</td><td>512 MiB</td><td>0.61 ms</td><td>0.35 / 0.17 / 0.00 GB</td></tr>
+        <tr><td>MNIST MLP</td><td>2<sup>15</sup>, 13</td><td>1,655</td><td>512 MiB</td><td>2.25 ms</td><td>0.73 / 0.95 / 0.27 GB</td></tr>
+        <tr><td>LoLa + HEIR bootstrap</td><td>2<sup>17</sup>, 47</td><td>625</td><td>512 MiB</td><td>202.75 ms</td><td>61.43 / 24.58 / 112.46 GB</td></tr>
+        <tr><td>&hellip; same</td><td>2<sup>17</sup>, 47</td><td>625</td><td>2 GiB</td><td>101.45 ms</td><td>47.92 / 24.58 / 21.20 GB</td></tr>
+    </table>
+    </div>
+    <ul>
+        <li><strong>Inference is weight-bound too.</strong> The MLP moves more plaintext (its weights) than key material: compiler-chosen packing makes plaintext traffic a first-class cost.</li>
+        <li><strong>The compiler's parameters can outgrow the chip.</strong> To fit a bootstrap under a tiny level budget HEIR moved to N = 2<sup>17</sup> with 47 primes. One key switch then needs 354 MiB of scratch, ciphertexts thrash the 512 MiB scratchpad, and the program takes 203 ms. That is a co-design conversation the simulator makes concrete.</li>
+        <li><strong>Cross-checked against OpenFHE.</strong> The same LoLa, through HEIR's OpenFHE code generation and the instrumented library, performs exactly the 55 rotations, 41 rotation keys and 2 relinearisations the front end reads from the IR. The library run costs 3&times; more on the ARK-class model (1.84 against 0.61 ms): its generated context carries 12 limbs where HEIR's level analysis needs 6, and its automatic rescaling adds 641 polynomial rescales to HEIR's 19 rescale ops.</li>
+    </ul>
+</section>
+
+<section class="slide" id="slide-13">
+    <div class="slide-number">13</div>
     <h2>Reading the Code</h2>
     <p><a href="https://github.com/BrendanJamesLynskey/FHE_Accelerator_Sim">FHE_Accelerator_Sim</a> follows the structure of the sister repo, <a href="https://github.com/BrendanJamesLynskey/Disaggregated_Inference_Sim">Disaggregated_Inference_Sim</a>: scheme model, cost model, engine and probes in separate files.</p>
     <div class="table-wrap">
@@ -1961,27 +1983,29 @@
         <tr><td><code>metrics.py</code>, <code>trace.py</code></td><td>Metrics, bound attribution, hot-spots; Perfetto export</td></tr>
         <tr><td><code>precision.py</code></td><td>Functional model of an analogue NTT (deck 04)</td></tr>
         <tr><td><code>search.py</code></td><td>Analytic bound, sweeps, bisection, Pareto front</td></tr>
+        <tr><td><code>heir_frontend.py</code></td><td>Reads HEIR's <code>ckks</code>-dialect output: parameters, levels, SSA dependencies, bootstraps and Chebyshev activations, as a trace</td></tr>
         <tr><td><code>openfhe_trace.py</code></td><td>Reads a kernel stream recorded from instrumented OpenFHE; per-stage counts; converts it to a replayable trace</td></tr>
         <tr><td><code>web/sim_engine.js</code></td><td>The port running on this page, with its minimal SimPy core</td></tr>
     </table>
     </div>
     <div class="code-block">
         <div class="code-header">Quick start</div>
-        <pre><code>pip install -e .[dev] &amp;&amp; pytest                        <span class="cm"># 74 tests</span>
+        <pre><code>pip install -e .[dev] &amp;&amp; pytest                        <span class="cm"># 89 tests</span>
 fhe-sim                                                <span class="cm"># the default run on slide 08</span>
 fhe-sim --counts                                       <span class="cm"># deck 02's per-stage table</span>
 fhe-sim --sweep-sram 128 256 512 1024 2048             <span class="cm"># traffic against SRAM</span>
 fhe-sim --min-ks --seeded-keys --otf-pt --trace b.json <span class="cm"># open in ui.perfetto.dev</span>
 fhe-sim --openfhe-log calibration/openfhe_trace/sparse16.log.gz --hw cpu   <span class="cm"># a real OpenFHE bootstrap</span>
+fhe-sim --heir calibration/heir/lola.ckks.mlir.gz         <span class="cm"># LoLa, compiled by HEIR</span>
 python examples/results.py                             <span class="cm"># every number in this series</span></code></pre>
     </div>
 </section>
 
-<section class="slide" id="slide-13">
-    <div class="slide-number">13</div>
+<section class="slide" id="slide-14">
+    <div class="slide-number">14</div>
     <h2>What to Take Away</h2>
     <ul>
-        <li><strong>A kernel-level trace</strong> is the contract between the scheme (or compiler) and the hardware model; keep them separate.</li>
+        <li><strong>A kernel-level trace</strong> is the contract between the scheme (or compiler) and the hardware model; keep them separate. HEIR's IR plugs straight in: real programs, with the compiler's own levels and bootstraps.</li>
         <li><strong>Model keys as named objects</strong> in a capacity-limited scratchpad, or the SRAM question cannot be asked.</li>
         <li><strong>Units and HBM as SimPy resources</strong>, dependencies as events and an issue window give overlap without cycle-level detail: a bootstrap in about 70 ms of Python or 12 ms of JavaScript.</li>
         <li><strong>The default ARK-class design is memory-bound</strong> (13.94 ms, HBM 89% busy), with CoeffToSlot as the hot-spot.</li>
