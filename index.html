@@ -988,12 +988,12 @@
             <h4>Energy and power</h4>
             <ul>
                 <li>Static 40 W, plus 10 pJ per butterfly, 5 pJ per multiply-add, 1 pJ per permuted word, 1 pJ per SRAM byte and 30 pJ per HBM byte (illustrative); logic energy scales with s<sup>2</sup>.</li>
-                <li><strong>TDP enforced by default</strong>: s is the largest clock whose worst case (every unit and HBM flat out) fits the TDP, found by bisection.</li>
-                <li>Optional DVFS: a memory-bound run is re-run at a clock that just keeps the busiest compute unit as busy as HBM.</li>
+                <li><strong>TDP enforced by a dynamic power manager</strong> (default): when a kernel starts, it gets the highest clock (down to s<sub>min</sub>) whose power fits the headroom left by everything running at that moment; an HBM chunk gets the highest bandwidth that fits (down to 25%). If nothing fits, the request waits for power to be released.</li>
+                <li>Optional DVFS caps the clock of a memory-bound run at the level that just keeps the busiest compute unit as busy as HBM.</li>
             </ul>
         </div>
     </div>
-    <p>Worst-case clocking guarantees the peak never exceeds the TDP, and a test checks it on every configuration. It is conservative: a real power manager would clock up when HBM is idle. That conservatism explains a surprise in deck 05, where very fast HBM <em>lowers</em> the compute clock. Methodology for all of this is in <a href="https://brendanjameslynskey.github.io/InfSim_07_Power_and_Energy/">LLM Inference Simulators deck 07</a>.</p>
+    <p>The manager guarantees the peak never exceeds the TDP, and a test checks it on every configuration, including Hypothesis-generated ones. It is greedy and first-come, with the clock chosen by bisection (no transcendentals, so the JavaScript port matches it bit for bit). The older alternative, one <strong>worst-case</strong> clock at which every unit and HBM flat out fit the TDP, is kept as <code>power_mode="worst-case"</code>. It reserves power for a coincidence the workload never produces, so it can be 1.8&times; slower, or unable to run at all at a low TDP (deck 05). Methodology for all of this is in <a href="https://brendanjameslynskey.github.io/InfSim_07_Power_and_Energy/">LLM Inference Simulators deck 07</a>.</p>
 </section>
 
 <section class="slide" id="slide-08">
@@ -1004,7 +1004,7 @@
         <tr><th>Metric</th><th>Definition</th></tr>
         <tr><td>Latency, per stage</td><td>Simulated time; span of each stage from its first operation's start to its last operation's end</td></tr>
         <tr><td>Utilisation</td><td>Busy time &divide; total time for NTT, MAC, automorphism, optical and HBM</td></tr>
-        <tr><td>Bound attribution</td><td>The most-utilised resource: HBM &rarr; memory-bound; NTT (or optical) &rarr; NTT-bound; MAC &rarr; MAC-bound; plus "power-bound" when the TDP lowered the clock of a compute-bound design</td></tr>
+        <tr><td>Bound attribution</td><td>The most-utilised resource: HBM &rarr; memory-bound; NTT (or optical) &rarr; NTT-bound; MAC &rarr; MAC-bound; plus "power-bound" when a compute-bound design lost more than 10% of the run to the power manager (or, with a worst-case clock, ran below 100%)</td></tr>
         <tr><td>Hot-spot per stage</td><td>For each stage, the resource with the most busy time attributed to that stage's operations</td></tr>
         <tr><td>Traffic by class</td><td>HBM bytes for keys, plaintexts, ciphertext reads and writes; key share of the total</td></tr>
         <tr><td>Energy, power</td><td>Static &times; time + dynamic per unit + HBM; average power; peak instantaneous power from active units</td></tr>
@@ -1032,7 +1032,8 @@
             <div class="control-row"><label for="fs-nb">Bootstraps</label><input type="range" id="fs-nb" min="1" max="4" value="1"><span class="val" id="fs-nb-val">1</span></div>
             <div class="control-row"><label><input type="checkbox" id="fs-hoist" checked> hoisting</label><label><input type="checkbox" id="fs-minks"> Min-KS</label></div>
             <div class="control-row"><label><input type="checkbox" id="fs-seed"> seeded keys</label><label><input type="checkbox" id="fs-otf"> OTF plaintexts</label></div>
-            <div class="control-row"><label><input type="checkbox" id="fs-dvfs"> DVFS</label><label><input type="checkbox" id="fs-tdpon" checked> enforce TDP</label></div>
+            <div class="control-row"><label><input type="checkbox" id="fs-dvfs"> DVFS</label></div>
+            <div class="control-row"><label for="fs-pm">Power control</label><select id="fs-pm"><option value="dynamic" selected>dynamic manager</option><option value="worst-case">worst-case clock</option><option value="0">TDP not enforced</option></select></div>
         </div>
         <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-top:0.75rem;">
             <button class="btn" id="fs-run">Run</button>
@@ -1298,7 +1299,7 @@
         const hw = Object.assign({ name: 'Digital FHE accelerator (ARK-class, illustrative)', freqGhz: 1.0, nttBflyPerCycle: 4096,
             macLanes: 8192, autoWordsPerCycle: 4096, sramMib: 512, sramGbps: 20000.0, hbmGbps: 1000.0, hbmChunkMib: 4, window: 4,
             tdpW: 250.0, staticW: 40.0, pjBfly: 10.0, pjMac: 5.0, pjAutoWord: 1.0, pjSramByte: 1.0, pjHbmByte: 30.0, sMin: 0.5,
-            enforceTdp: true, optical: null }, o);
+            enforceTdp: true, powerMode: 'dynamic', hbmMinFrac: 0.25, optical: null }, o);
         hw.sramBytes = hw.sramMib * MiB;
         hw.rate = u => ({ ntt: hw.nttBflyPerCycle, mac: hw.macLanes, auto: hw.autoWordsPerCycle })[u] * hw.freqGhz * 1e9;
         hw.pj = u => ({ ntt: hw.pjBfly, mac: hw.pjMac, auto: hw.pjAutoWord })[u];
@@ -1346,8 +1347,8 @@
         const seg = (unit, work, words) => {
             const tLogic = work / (hw.rate(unit) * s), tSram = words * 8 / (hw.sramGbps * 1e9 * s);
             const t = tLogic >= tSram ? tLogic : tSram;
-            const e = work * hw.pj(unit) * 1e-12 * s * s + words * 8 * hw.pjSramByte * 1e-12;
-            return { unit, time: t, energy: e, work, dac: 0, adc: 0 };
+            const el = work * hw.pj(unit) * 1e-12 * s * s, es = words * 8 * hw.pjSramByte * 1e-12;
+            return { unit, time: t, energy: el + es, work, dac: 0, adc: 0, eLogic: el, eSram: es, scalable: true };
         };
         return {
             s, staticW: hw.staticW + (hw.optical ? hw.optical.staticW : 0.0),
@@ -1360,7 +1361,7 @@
                 const blocks = k.amount * (N / o.block);
                 const dac = blocks * dacPlanes * 2 * o.block, adc = blocks * adcPlanes * 2 * o.block;
                 const t = (dac >= adc ? dac : adc) / o.samplesPerS;
-                segs.push({ unit: 'optical', time: t, energy: dac * o.pjDac() * 1e-12 + adc * o.pjAdc() * 1e-12, work: dac + adc, dac, adc });
+                segs.push({ unit: 'optical', time: t, energy: dac * o.pjDac() * 1e-12 + adc * o.pjAdc() * 1e-12, work: dac + adc, dac, adc, eLogic: 0, eSram: 0, scalable: false });
                 const corr = k.amount * N * (o.ideal ? 3 : d + adcPlanes + 3);
                 segs.push(seg('mac', corr, 3 * corr));
                 return segs;
@@ -1489,13 +1490,22 @@
         }
     }
 
+    // a segment costed at full clock, run at clock fraction s (mirror of Segment.at / Segment.power)
+    const segAt = (seg, s) => [seg.time / s, seg.eLogic * s * s + seg.eSram];
+    const segPower = (seg, s) => { const [t, e] = segAt(seg, s); return e / t; };
+
     function runSim(trace, hw, clock, traceOn) {
-        const p = trace.params, env = new Env(), cost = costModel(hw, p.logN, p.qBits, clock);
+        const dynamic = hw.enforceTdp && hw.powerMode === 'dynamic';
+        if (hw.powerMode !== 'dynamic' && hw.powerMode !== 'worst-case') throw new Error(`unknown powerMode ${hw.powerMode}`);
+        const p = trace.params, env = new Env(), cost = costModel(hw, p.logN, p.qBits, dynamic ? 1.0 : clock);
+        const cap = clock, budget = hw.tdpW - cost.staticW;
+        if (dynamic && budget <= 0) throw new Error(`TDP ${hw.tdpW} W is below static power`);
+        let pwait = [], nActive = 0;
         const units = {}; for (const u of UNITS) units[u] = new Resource(env, 1);
         const hbm = new Resource(env, 1);
         const st = { busy: { ntt: 0, mac: 0, auto: 0, optical: 0, hbm: 0 }, work: { ntt: 0, mac: 0, auto: 0, optical: 0 },
                      energy: { ntt: 0, mac: 0, auto: 0, optical: 0, hbm: 0 }, bytes: { key: 0, pt: 0, ct_read: 0, ct_write: 0 },
-                     dac: 0, adc: 0, stageBusy: {}, stageFirst: {}, stageLast: {}, peakW: 0 };
+                     dac: 0, adc: 0, stageBusy: {}, stageFirst: {}, stageLast: {}, peakW: 0, powerLoss: 0, clockTime: 0, computeTime: 0 };
         const spans = [];
         const n = trace.ops.length, producer = {}, lastUse = {};
         for (const o of trace.ops) producer[o.output] = o.id;
@@ -1526,6 +1536,38 @@
             return pl;
         }
         const power = dp => { pNow += dp; if (pNow > st.peakW) st.peakW = pNow; };
+        // ── the dynamic power manager (mirror of sim.py) ──
+        function fit(seg) {
+            const head = budget - pNow;
+            if (!seg.scalable) return seg.energy / seg.time <= head ? 1.0 : null;
+            if (segPower(seg, cap) <= head) return cap;
+            let lo = hw.sMin < cap ? hw.sMin : cap;
+            if (segPower(seg, lo) > head) return null;
+            let hi = cap;
+            for (let i = 0; i < 50; i++) { const mid = (lo + hi) / 2; if (segPower(seg, mid) <= head) lo = mid; else hi = mid; }
+            return lo;
+        }
+        function fitHbm() {
+            const head = budget - pNow;
+            if (hbmW <= head) return 1.0;
+            const f = head / hbmW;
+            return f >= hw.hbmMinFrac ? f : null;
+        }
+        function* waitPower(fitFn, what) {
+            const t0 = env.now; let x;
+            for (;;) {
+                x = fitFn();
+                if (x !== null) break;
+                if (nActive === 0) throw new Error(`TDP ${hw.tdpW} W cannot power ${what} even at the lowest setting`);
+                const ev = env.event(); pwait.push(ev); yield ev;
+            }
+            st.powerLoss += env.now - t0;
+            return x;
+        }
+        function releasePower(dp) {
+            power(-dp); nActive--;
+            if (pwait.length) { const waiting = pwait; pwait = []; for (const ev of waiting) ev.succeed(); }
+        }
         const stageBusy = (stage, unit, dt) => { const d = st.stageBusy[stage] || (st.stageBusy[stage] = {}); d[unit] = (d[unit] || 0.0) + dt; };
         function* waitDone(i) { if (!done[i]) yield doneEv[i]; }
         function* xfer(nbytes, cls, stage) {
@@ -1533,10 +1575,22 @@
             while (left > 0) {
                 const sz = left < chunk ? left : chunk;
                 const req = hbm.request(); yield req;
-                const start = env.now; power(hbmW);
-                const dt = sz / bw;
-                yield env.timeout(dt);
-                power(-hbmW); hbm.release(req);
+                const start = env.now;
+                let dt;
+                if (dynamic) {
+                    const f = yield* waitPower(fitHbm, 'HBM');
+                    const pw = f >= 1.0 ? hbmW : hbmW * f;
+                    dt = f >= 1.0 ? sz / bw : sz / (bw * f);
+                    st.powerLoss += dt - sz / bw;
+                    nActive++; power(pw);
+                    yield env.timeout(dt);
+                    releasePower(pw); hbm.release(req);
+                } else {
+                    power(hbmW);
+                    dt = sz / bw;
+                    yield env.timeout(dt);
+                    power(-hbmW); hbm.release(req);
+                }
                 st.busy.hbm += dt; st.energy.hbm += sz * hw.pjHbmByte * 1e-12; stageBusy(stage, 'hbm', dt);
                 if (traceOn) spans.push(['hbm', stage, start, dt, cls]);
                 left -= sz;
@@ -1556,13 +1610,23 @@
             for (const k of o.kernels) {
                 for (const seg of cost.segments(k)) {
                     const req = units[seg.unit].request(); yield req;
-                    const start = env.now, pw = seg.time > 0 ? seg.energy / seg.time : 0.0;
+                    let sc, t, e;
+                    if (dynamic) {
+                        sc = yield* waitPower(() => fit(seg), seg.unit);
+                        [t, e] = seg.scalable ? segAt(seg, sc) : [seg.time, seg.energy];
+                        st.powerLoss += t - seg.time;
+                        nActive++;
+                    } else { sc = cost.s; t = seg.time; e = seg.energy; }
+                    const start = env.now, pw = t > 0 ? e / t : 0.0;
                     power(pw);
-                    yield env.timeout(seg.time);
-                    power(-pw); units[seg.unit].release(req);
-                    st.busy[seg.unit] += seg.time; st.work[seg.unit] += seg.work; st.energy[seg.unit] += seg.energy;
-                    st.dac += seg.dac; st.adc += seg.adc; stageBusy(o.stage, seg.unit, seg.time);
-                    if (traceOn) spans.push([seg.unit, o.stage, start, seg.time, `${o.op}.${k.kind} L${o.level}`]);
+                    yield env.timeout(t);
+                    if (dynamic) releasePower(pw); else power(-pw);
+                    units[seg.unit].release(req);
+                    st.busy[seg.unit] += t; st.work[seg.unit] += seg.work; st.energy[seg.unit] += e;
+                    st.dac += seg.dac; st.adc += seg.adc;
+                    if (seg.scalable) { st.clockTime += sc * t; st.computeTime += t; }
+                    stageBusy(o.stage, seg.unit, t);
+                    if (traceOn) spans.push([seg.unit, o.stage, start, t, `${o.op}.${k.kind} L${o.level}`]);
                 }
             }
             if (pl.outWrite) yield* xfer(pl.outWrite, 'ct_write', o.stage);
@@ -1579,12 +1643,15 @@
         }
         env.process(issuer());
         env.run();
-        return { trace, hw, clock: cost.s, horizon: env.now, stats: st, opStart, opEnd, staticW: cost.staticW, spans };
+        let meanClock = cost.s;
+        if (dynamic && st.computeTime > 0) meanClock = st.clockTime / st.computeTime;
+        return { trace, hw, clock: meanClock, horizon: env.now, stats: st, opStart, opEnd, staticW: cost.staticW, spans };
     }
 
     function simulate(trace, hw, opt) {
         opt = opt || {};
-        const s = opt.clock !== undefined && opt.clock !== null ? opt.clock : hw.tdpClock();
+        const s = opt.clock !== undefined && opt.clock !== null ? opt.clock
+                : (hw.enforceTdp && hw.powerMode === 'dynamic') ? 1.0 : hw.tdpClock();
         let res = runSim(trace, hw, s, !!opt.trace);
         if (opt.dvfs && (opt.clock === undefined || opt.clock === null)) {
             const b = res.stats.busy;
@@ -1608,7 +1675,9 @@
         let top = 'hbm';
         for (const u of resources) if (util[u] > util[top]) top = u;
         let bound = BOUND_NAME[top];
-        if (res.clock < 1.0 && top !== 'hbm' && hw.enforceTdp) bound = 'power-bound (' + BOUND_NAME[top] + ' at a TDP-limited clock)';
+        const dynamic = hw.enforceTdp && hw.powerMode === 'dynamic';
+        if (top !== 'hbm' && hw.enforceTdp && ((dynamic && st.powerLoss > 0.1 * H) || (!dynamic && res.clock < 1.0)))
+            bound = 'power-bound (' + BOUND_NAME[top] + ' at a TDP-limited clock)';
         const stages = {}, hot = {};
         for (const s of STAGES) {
             if (!(s in st.stageFirst)) continue;
@@ -1635,15 +1704,16 @@
             hbmBytes: Object.assign({}, b, { total: hbmTotal, keyShare: hbmTotal ? b.key / hbmTotal : 0.0 }),
             energy: { totalJ: total, perBootstrapJ: total / nBoot, avgPowerW: total / H, peakW: res.staticW + st.peakW, tdpW: hw.tdpW,
                       breakdown: br, dacSamples: st.dac, adcSamples: st.adc },
-            lowerBoundS: lower,
+            lowerBoundS: lower, powerMode: hw.enforceTdp ? hw.powerMode : 'none', powerLossS: st.powerLoss,
         };
     }
 
     // ── convenience for the parity test and the deck ─────────────────
     const camel = o => { const m = { n_boot: 'nBoot', min_ks: 'minKs', seeded_keys: 'seededKeys', otf_plaintexts: 'otfPlaintexts' }, out = {};
         for (const [k, v] of Object.entries(o || {})) out[m[k] || k] = v; return out; };
-    function simulateNamed(paramsName, hwName, opts, dvfs) {
-        const p = mkParams(PARAMS[paramsName]), hw = ACCELERATORS[hwName]();
+    function simulateNamed(paramsName, hwName, opts, dvfs, hwOver) {
+        const p = mkParams(PARAMS[paramsName]);
+        const hw = hwOver ? withHw(ACCELERATORS[hwName](), hwOver) : ACCELERATORS[hwName]();
         return simulate(bootstrapTrace(p, camel(opts)), hw, { dvfs: !!dvfs });
     }
     root.FheSim = { PARAMS, ACCELERATORS, STAGES, UNITS, mkParams, bootstrapTrace, heOpTrace, summariseTrace, accelerator, optical, withHw,
@@ -1666,13 +1736,13 @@
             const hw = F.ACCELERATORS[$('fs-h').value]();
             const lg = v => Math.round(Math.log2(Math.max(v, 1)));
             $('fs-ntt').value = Math.max(7, lg(hw.nttBflyPerCycle)); $('fs-mac').value = Math.max(8, lg(hw.macLanes)); $('fs-sram').value = lg(hw.sramMib);
-            $('fs-hbm').value = hw.hbmGbps; $('fs-tdp').value = hw.tdpW; $('fs-win').value = hw.window; $('fs-tdpon').checked = hw.enforceTdp;
+            $('fs-hbm').value = hw.hbmGbps; $('fs-tdp').value = hw.tdpW; $('fs-win').value = hw.window; $('fs-pm').value = hw.enforceTdp ? hw.powerMode : '0';
             show();
         }
         $('fs-h').addEventListener('change', loadPreset);
         function hardware(){
             const base = F.ACCELERATORS[$('fs-h').value](), cpu = $('fs-h').value === 'cpu';
-            const o = { hbmGbps: +$('fs-hbm').value, tdpW: +$('fs-tdp').value, window: +$('fs-win').value, enforceTdp: $('fs-tdpon').checked,
+            const o = { hbmGbps: +$('fs-hbm').value, tdpW: +$('fs-tdp').value, window: +$('fs-win').value, enforceTdp: $('fs-pm').value !== '0', powerMode: $('fs-pm').value === '0' ? 'dynamic' : $('fs-pm').value,
                         sramMib: 2 ** +$('fs-sram').value };
             if (!cpu) { o.nttBflyPerCycle = 2 ** +$('fs-ntt').value; o.macLanes = 2 ** +$('fs-mac').value; }
             return F.withHw(base, o);
@@ -1684,7 +1754,7 @@
         function show1(m){
             const cell = (l, v) => `<div class="metric"><div class="metric-label">${l}</div><div class="metric-value">${v}</div></div>`;
             const b = m.hbmBytes, e = m.energy;
-            $('fs-m').innerHTML = [cell('Per bootstrap', ms(m.perBootstrapS)), cell('Clock', (100 * m.clock).toFixed(0) + '%'),
+            $('fs-m').innerHTML = [cell('Per bootstrap', ms(m.perBootstrapS)), cell('Mean clock', (100 * m.clock).toFixed(0) + '%'),
                 cell('Key traffic', (b.key / 1e9).toFixed(2) + ' GB'), cell('All HBM traffic', (b.total / 1e9).toFixed(2) + ' GB'),
                 cell('Energy / bootstrap', (1e3 * e.perBootstrapJ).toFixed(0) + ' mJ'), cell('Avg / peak power', `${e.avgPowerW.toFixed(0)} / ${e.peakW.toFixed(0)} W`)].join('');
             const hs = Object.entries(m.hotspots.perStage).map(([s, r]) => `${NAMES[s]}&rarr;${r}`).join(' &middot; ');
@@ -1796,7 +1866,7 @@
         <li><strong>Buy SRAM.</strong> Press <em>SRAM sweep</em>. Key traffic does not move from 512 MiB upwards (each key is used once); only ciphertext spills disappear.</li>
         <li><strong>Change the algorithm instead.</strong> Tick Min-KS and seeded keys, or press <em>Compare algorithms</em>: key traffic falls about tenfold and the verdict moves to the MAC lanes.</li>
         <li><strong>Starve the NTTs.</strong> Choose <em>small digital</em> and compare algorithms again: on an NTT-bound design the same techniques make bootstrapping slower.</li>
-        <li><strong>Hit the power wall.</strong> Raise NTT to 16,384 and MAC to 32,768: the clock drops below 100% and the verdict becomes power-bound. Untick <em>enforce TDP</em> to see what the TDP is costing.</li>
+        <li><strong>Hit the power wall.</strong> Raise NTT to 16,384 and MAC to 32,768, tick the three key techniques and lower the TDP to 150 W. The dynamic manager still runs at a mean clock near 100%; switch <em>Power control</em> to <em>worst-case clock</em> and the same design slows to about half speed. At 100 W the worst-case clock cannot run at all, and the manager becomes power-bound.</li>
         <li><strong>Back-to-back bootstraps.</strong> Set 2 bootstraps with a large SRAM: keys are reused across bootstraps only when the whole key set fits (about 16 GiB, beyond the slider).</li>
     </ol>
 </section>
@@ -1804,7 +1874,7 @@
 <section class="slide" id="slide-11">
     <div class="slide-number">11</div>
     <h2>Validation</h2>
-    <p>56 tests, organised as a verification ladder (the method is in <a href="https://brendanjameslynskey.github.io/InfSim_06_Metrics_Hotspots_Validation/">LLM Inference Simulators deck 06</a>):</p>
+    <p>64 tests, organised as a verification ladder (the method is in <a href="https://brendanjameslynskey.github.io/InfSim_06_Metrics_Hotspots_Validation/">LLM Inference Simulators deck 06</a>):</p>
     <div class="table-wrap">
     <table>
         <tr><th>Rung</th><th>Checks</th></tr>
@@ -1813,9 +1883,9 @@
         <tr><td>Invariants</td><td>Dependencies respected; work conserved on every unit; traffic at least compulsory; reads only after writes; determinism; probes passive</td></tr>
         <tr><td>Analytic</td><td>A dependent chain sums exactly; independent load-then-compute operations match the two-machine flow-shop makespan a + b + (n&minus;1)&middot;max(a, b) to 1e-12; simulated time &ge; the roofline bound</td></tr>
         <tr><td>Behaviour</td><td>More SRAM never raises traffic; the baseline is memory-bound; key-reuse techniques shift the bound; they hurt NTT-bound designs; optics helps NTT-bound designs and not memory-bound ones</td></tr>
-        <tr><td>Power</td><td>Energy accounts add up; peak &le; TDP for designs whose worst case exceeds it; DVFS saves energy when memory-bound</td></tr>
-        <tr><td>Property-based</td><td>Hypothesis: 60 random parameter sets, algorithms and hardware; all invariants, the TDP and determinism</td></tr>
-        <tr><td>External</td><td>Optical precision rule against a functional model (deck 04); calibration against OpenFHE; JavaScript against Python, bit-exact on 16 configurations</td></tr>
+        <tr><td>Power</td><td>Energy accounts add up; peak &le; TDP under both power modes, down to a 100 W TDP; the dynamic manager beats worst-case clocking where that wastes the budget and throttles when the real draw binds; DVFS saves energy when memory-bound</td></tr>
+        <tr><td>Property-based</td><td>Hypothesis: 60 random parameter sets, algorithms, hardware and power modes; all invariants, the TDP and determinism</td></tr>
+        <tr><td>External</td><td>Optical precision rule against a functional model (deck 04); calibration against OpenFHE; JavaScript against Python, bit-exact on 22 configurations, in both power modes</td></tr>
     </table>
     </div>
     <div class="table-wrap">
@@ -1848,7 +1918,7 @@
     </div>
     <div class="code-block">
         <div class="code-header">Quick start</div>
-        <pre><code>pip install -e .[dev] &amp;&amp; pytest                        <span class="cm"># 56 tests</span>
+        <pre><code>pip install -e .[dev] &amp;&amp; pytest                        <span class="cm"># 64 tests</span>
 fhe-sim                                                <span class="cm"># the default run on slide 08</span>
 fhe-sim --counts                                       <span class="cm"># deck 02's per-stage table</span>
 fhe-sim --sweep-sram 128 256 512 1024 2048             <span class="cm"># traffic against SRAM</span>
@@ -1863,7 +1933,7 @@ python examples/results.py                             <span class="cm"># every 
     <ul>
         <li><strong>A kernel-level trace</strong> is the contract between the scheme (or compiler) and the hardware model; keep them separate.</li>
         <li><strong>Model keys as named objects</strong> in a capacity-limited scratchpad, or the SRAM question cannot be asked.</li>
-        <li><strong>Units and HBM as SimPy resources</strong>, dependencies as events and an issue window give overlap without cycle-level detail: a bootstrap in about 60 ms of Python or 10 ms of JavaScript.</li>
+        <li><strong>Units and HBM as SimPy resources</strong>, dependencies as events and an issue window give overlap without cycle-level detail: a bootstrap in about 70 ms of Python or 12 ms of JavaScript.</li>
         <li><strong>The default ARK-class design is memory-bound</strong> (13.94 ms, HBM 89% busy), with CoeffToSlot as the hot-spot.</li>
         <li><strong>Validation is layered</strong>: hand formulas, invariants, flow-shop algebra, behaviour, properties, a functional model, OpenFHE timings and a bit-exact twin.</li>
     </ul>
