@@ -1022,7 +1022,7 @@
         <tr><td>Hot-spot per stage</td><td>For each stage, the resource with the most busy time attributed to that stage's operations</td></tr>
         <tr><td>Traffic by class</td><td>HBM bytes for keys, plaintexts, ciphertext reads and writes; key share of the total</td></tr>
         <tr><td>Energy, power</td><td>Static &times; time + dynamic per unit + HBM; average power; peak instantaneous power from active units</td></tr>
-        <tr><td>Lower bounds</td><td>Busiest resource's busy time (a schedule bound) and an analytic roofline bound from the trace alone</td></tr>
+        <tr><td><a href="https://brendanjameslynskey.github.io/SimEng_12_Measurement_Tools_and_Methods/#card-bounds">Lower bounds</a></td><td>Busiest resource's busy time (a schedule bound) and an analytic roofline bound from the trace alone</td></tr>
         <tr><td>Perfetto trace</td><td><code>--trace boot.json</code>: one row per unit and for HBM, one slice per kernel and per chunk</td></tr>
     </table>
     </div>
@@ -2009,7 +2009,7 @@
         <tr><td><code>sim.py</code></td><td>SimPy engine: units, HBM, scratchpad, issue window, prefetch, write-backs, DVFS</td></tr>
         <tr><td><code>metrics.py</code>, <code>trace.py</code></td><td>Metrics, bound attribution, hot-spots; Perfetto export</td></tr>
         <tr><td><code>precision.py</code></td><td>Functional model of an analogue NTT (deck 04)</td></tr>
-        <tr><td><code>search.py</code></td><td>Analytic bound, sweeps, bisection, Pareto front</td></tr>
+        <tr><td><code>search.py</code></td><td><a href="https://brendanjameslynskey.github.io/SimEng_12_Measurement_Tools_and_Methods/#card-bounds">Analytic bound</a>, sweeps, bisection, Pareto front</td></tr>
         <tr><td><code>heir_frontend.py</code></td><td>Reads HEIR's <code>ckks</code>-dialect output: parameters, levels, SSA dependencies, bootstraps and Chebyshev activations, as a trace</td></tr>
         <tr><td><code>openfhe_trace.py</code></td><td>Reads a kernel stream recorded from instrumented OpenFHE; per-stage counts; converts it to a replayable trace</td></tr>
         <tr><td><code>web/sim_engine.js</code></td><td>The port running on this page, with its minimal SimPy core</td></tr>
